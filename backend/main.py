@@ -45,13 +45,13 @@ SUPABASE_BUCKET = "bidding-projects"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1"  # Confirm your endpoint URL
 
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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"
+    api_key="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"
 )
 
 
@@ -328,15 +328,26 @@ def get_filtered_count(batch_id: Optional[str] = Query(None)):
 @app.delete("/delete")
 def delete_all_bids():
     try:
-        response = supabase.table("BiddingDB").delete().neq("id", 0).execute()
-        if response.status_code not in (200, 204):
-            raise HTTPException(status_code=500, detail="Failed to delete bids")
+        total_deleted = 0
+        batch_size = 1000
 
-        return {"message": "All bids deleted successfully."}
+        while True:
+            # Step 1: Fetch a batch of IDs to delete
+            response = supabase.table("BiddingDB").select("id").limit(batch_size).execute()
+            ids = [row["id"] for row in response.data]
+
+            if not ids:
+                break  # No more records to delete
+
+            # Step 2: Delete by IDs
+            supabase.table("BiddingDB").delete().in_("id", ids).execute()
+            total_deleted += len(ids)
+
+        return {"message": f"Deleted {total_deleted} bids successfully."}
+
     except Exception:
         logger.exception("Error deleting all bids")
         raise HTTPException(status_code=500, detail="Internal server error")
-    
 
 
 
@@ -471,7 +482,7 @@ async def get_openrouter_completion(prompt: str, retries=3, delay=1):
                     {"role": "user", "content": prompt}
                 ],
                 extra_headers={
-                    "HTTP-Referer": "http://127.0.0.1:8000/",
+                    "HTTP-Referer": "",
                     "X-Title": "Your Site Name",
                 },
             )
@@ -517,7 +528,7 @@ Provide a concise, professional summary answering points 1 to 4.
 """
 
     completion = await get_openrouter_completion(prompt)
-    answer = completion.choices[0].message.content.strip()
+    answer = completion["choices"][0]["message"]["content"].strip()
 
     return {
         "reference_no": reference_no,
@@ -528,26 +539,37 @@ class UserQuestion(BaseModel):
     question: str
 
 
-
 class UserQuestion(BaseModel):
     question: str
+
+
+def fetch_all_bidding_records(batch_size=1000):
+    all_data = []
+    start = 0
+
+    while True:
+        response = supabase.table("BiddingDB").select("*").range(start, start + batch_size - 1).execute()
+        data = response.data
+        if not data:
+            break
+        all_data.extend(data)
+        start += batch_size
+
+    return all_data
 
 @app.post("/ask")
 async def ask_bot(req: UserQuestion):
     query = req.question.strip()
     print(f"[Aiva] User asked: {query}")
 
-    # Step 1: Fetch recent bidding records
-    all_records = supabase.table("BiddingDB").select("*").limit(100).execute().data or []
-    print(f"[Aiva] Retrieved {len(all_records)} records")
+    all_records = await asyncio.to_thread(fetch_all_bidding_records)
+
 
     if not all_records:
         raise HTTPException(status_code=404, detail="No bidding records available")
 
-    # Step 2: Format records into a prompt-friendly summary
-    summarized_records = []
-    for r in all_records:
-        summary = f"""
+    summarized_records = [
+        f"""
 ReferenceNo: {r.get('ReferenceNo')}
 Title: {r.get('Title')}
 Entity: {r.get('Entity')}
@@ -555,32 +577,30 @@ Category: {r.get('category')}
 Summary: {r.get('Summary')}
 Requirements: {r.get('REQT_LIST')}
 Budget: {r.get('ApprovedBudget') or 'N/A'}
-"""
-        summarized_records.append(summary.strip())
+""".strip() for r in all_records
+    ]
 
-    # Step 3: Send to LLM for smart matching + answering
     prompt = f"""
 You are Aiva, a smart bidding assistant.
 
-The user asked:
+User asked:
 "{query}"
 
-Here are recent bidding opportunities:
-
+Recent bidding records:
 {chr(10).join(summarized_records)}
 
 Please do the following:
-1. Identify the most relevant bidding record based on the user's question.
-2. If the user is asking for advice (e.g. how to win), provide strategic suggestions using only the matching record's data.
-3. If they are asking about a specific agency, ReferenceNo, or category, focus on that.
-4. If no relevant record is found, say so politely.
+1. Match the most relevant record.
+2. Provide strategic suggestions.
+3. Focus on specifics if mentioned (agency, ReferenceNo, category).
+4. Be honest if no match found.
 
-Be concise, helpful, and avoid making anything up.
+Keep it clear and factual.
 """
 
     try:
         completion = await get_openrouter_completion(prompt)
-        answer = completion.choices[0].message.content.strip()
+        answer = completion["choices"][0]["message"]["content"].strip()
         return {
             "question": query,
             "answer": answer
@@ -588,7 +608,6 @@ Be concise, helpful, and avoid making anything up.
     except Exception as e:
         print(f"[Aiva] Error with OpenRouter: {str(e)}")
         raise HTTPException(status_code=503, detail="Aiva is temporarily unavailable.")
-
 
 class ChatMessage(BaseModel):
     user_id: str
@@ -610,7 +629,7 @@ async def chat_with_bot(req: ChatMessage):
     prompt = f"You are a helpful bidding assistant.\n\nUser asked:\n{req.question}"
     try:
         completion = await get_openrouter_completion(prompt)
-        answer = completion.choices[0].message.content.strip()
+        answer = completion["choices"][0]["message"]["content"].strip()
     except Exception as e:
         # Optional: update message with error if needed
         answer = "Sorry, something went wrong while generating the response."
