@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BiddingDB Dashboard</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+    background: #f5f7fa;
+  }
+  h1 {
+    text-align: center;
+    margin-bottom: 20px;
+  }
+  .dashboard {
+    display: flex;
+    justify-content: space-around;
+    margin-bottom: 30px;
+  }
+  .card {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    width: 30%;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    text-align: center;
+  }
+  .card h2 {
+    margin: 0 0 10px 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    margin-bottom: 20px;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: left;
+  }
+  th {
+    background: #4CAF50;
+    color: white;
+  }
+  #terminal {
+    background: black;
+    color: #0f0;
+    font-family: monospace;
+    height: 150px;
+    overflow-y: auto;
+    padding: 10px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+  }
+  #scrapeBtn {
+    display: block;
+    margin: 0 auto;
+    padding: 12px 30px;
+    font-size: 16px;
+    background-color: #4CAF50;
+    border: none;
+    border-radius: 8px;
+    color: white;
+    cursor: pointer;
+  }
+  #scrapeBtn:hover {
+    background-color: #45a049;
+  }
+</style>
+</head>
+<body>
+
+<h1>BiddingDB Dashboard</h1>
+
+<div class="dashboard">
+  <div class="card" id="totalScraped">
+    <h2>Total Scraped</h2>
+    <p>0</p>
+  </div>
+  <div class="card" id="updatedAsOf">
+    <h2>Updated As Of</h2>
+    <p>--</p>
+  </div>
+  <div class="card" id="totalBiddings">
+    <h2>Total Biddings Available</h2>
+    <p>0</p>
+  </div>
+</div>
+
+<table id="bidsTable">
+  <thead>
+    <tr>
+      <th>ReferenceNo</th>
+      <th>Entity</th>
+      <th>Title</th>
+      <th>Classification</th>
+      <th>Category</th>
+      <th>ABC</th>
+      <th>Status</th>
+      <th>PublishDate</th>
+      <th>ClosingDate</th>
+    </tr>
+  </thead>
+  <tbody>
+    <!-- Data rows go here -->
+  </tbody>
+</table>
+
+<div id="terminal"></div>
+
+<button id="scrapeBtn">Run Scraper</button>
+
+<script>
+  const totalScrapedElem = document.querySelector("#totalScraped p");
+  const updatedAsOfElem = document.querySelector("#updatedAsOf p");
+  const totalBiddingsElem = document.querySelector("#totalBiddings p");
+  const bidsTableBody = document.querySelector("#bidsTable tbody");
+  const terminal = document.querySelector("#terminal");
+  const scrapeBtn = document.querySelector("#scrapeBtn");
+
+  // Function to append logs to terminal
+  function logToTerminal(message) {
+    const time = new Date().toLocaleTimeString();
+    terminal.textContent += `[${time}] ${message}\n`;
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  // Load bidding records and update dashboard cards
+  async function loadBids() {
+    try {
+      const res = await fetch("/bids");
+      const rawData = await res.json();
+      console.log("Raw API response:", rawData);
+      if (!Array.isArray(rawData) && !rawData.data) {
+  console.error("Response does not have expected array or data property");
+}
+
+      // Safely extract array from response
+      const data = Array.isArray(rawData) ? rawData : rawData.data;
+
+      if (!Array.isArray(data)) {
+        throw new Error("Invalid response format: expected array");
+      }
+
+      // Update total bids count
+      totalBiddingsElem.textContent = data.length;
+      totalScrapedElem.textContent = data.length;
+
+      // Updated as of - latest PublishDate
+      if (data.length > 0) {
+        const latestDate = data.reduce((latest, item) => {
+          return new Date(item.PublishDate) > new Date(latest) ? item.PublishDate : latest;
+        }, data[0].PublishDate);
+        updatedAsOfElem.textContent = new Date(latestDate).toLocaleString();
+      } else {
+        updatedAsOfElem.textContent = "--";
+      }
+
+      // Fill table
+      bidsTableBody.innerHTML = "";
+      data.forEach(bid => {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${bid.ReferenceNo || ""}</td>
+          <td>${bid.Entity || ""}</td>
+          <td>${bid.Title || ""}</td>
+          <td>${bid.Classification || ""}</td>
+          <td>${bid.Category || ""}</td>
+          <td>${bid.ABC || ""}</td>
+          <td>${bid.Status || ""}</td>
+          <td>${bid.PublishDate ? new Date(bid.PublishDate).toLocaleDateString() : ""}</td>
+          <td>${bid.ClosingDate ? new Date(bid.ClosingDate).toLocaleDateString() : ""}</td>
+        `;
+        bidsTableBody.appendChild(row);
+      });
+
+      logToTerminal("Bids loaded successfully.");
+    } catch (error) {
+      logToTerminal("Error loading bids: " + error.message);
+    }
+  }
+
+  // Function to trigger the scraper backend
+  async function runScraper() {
+    logToTerminal("Triggering scraper...");
+    try {
+      const res = await fetch("/scrape", { method: "POST" });
+      if (res.ok) {
+        logToTerminal("Scraper started successfully.");
+        setTimeout(loadBids, 5000);
+      } else {
+        logToTerminal("Failed to start scraper.");
+      }
+    } catch (error) {
+      logToTerminal("Error triggering scraper: " + error.message);
+    }
+  }
+
+  scrapeBtn.addEventListener("click", runScraper);
+  loadBids();
+</script>
+
+
+</body>
+</html>

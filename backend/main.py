@@ -1,0 +1,721 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from backend.models import BiddingRecord
+import asyncio
+import subprocess
+import threading
+from uuid import uuid4
+import logging
+import os
+from datetime import datetime
+from typing import Optional
+from fastapi.responses import StreamingResponse
+import pandas as pd
+import io
+import httpx
+from bs4 import BeautifulSoup
+import re
+from fastapi import Query
+from databases import Database
+import requests
+from pydantic import BaseModel
+import base64
+from fastapi import HTTPException
+from fastapi import APIRouter
+import logging
+from openai import OpenAI
+from fastapi.responses import RedirectResponse
+import json
+
+router = APIRouter()
+app = FastAPI()
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize Supabase client directly
+from supabase import create_client, Client
+
+
+SUPABASE_URL = "https://vphtpzlbdcotorqpuonr.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZwaHRwemxiZGNvdG9ycXB1b25yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDU1MDg0OTcsImV4cCI6MjA2MTA4NDQ5N30.XTP7clV__5ZVp9hZCJ2eGhL7HgEUeTcl2uINX0JC9WI"
+SUPABASE_BUCKET = "bidding-projects"
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+OPENROUTER_API_KEY = "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"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1"  # Confirm your endpoint URL
+
+
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key="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"
+)
+
+
+JIRA_EMAIL = "gffrancisco26@gmail.com"
+JIRA_API_KEY = "ATATT3xFfGF0l2cX6WUAxeDczPxjkd49GU0sE1lJFsuMwcBfopF6gmvCmNuI8Hon_hUjbd8e6P2TkFTdJ189tSaz8LJuYQnC3tgwWGhkSjnV6DSipSjNh-Vf3mt8Q94gfYygp1A0V8lFE60C3FdM0gY_cVxBadfAMLzDWleDvB-nLedE7vmqFFw=22F935DA"
+JIRA_PROJECT_KEY = "DEUS"
+JIRA_BASE_URL = "https://deusenterpriseco.atlassian.net/"
+
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, restrict to frontend origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/ping")
+async def ping():
+    return {"message": "pong"}
+
+app.mount("/app", StaticFiles(directory="frontend", html=True), name="frontend")
+
+# Global process handle
+scraper_process = None
+process_lock = threading.Lock()
+
+def run_scrapy_spider():
+    global scraper_process
+    try:
+        scrapy_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "philgeps_scraper"))
+        os.chdir(scrapy_path)
+
+        logger.info("Starting Scrapy spider process...")
+        scraper_process = subprocess.Popen(
+            ["scrapy", "crawl", "philgeps_docs"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = scraper_process.communicate()
+
+        if scraper_process.returncode == 0:
+            logger.info(f"Scrapy spider finished:\n{stdout}")
+        else:
+            logger.error(f"Scrapy spider failed:\n{stderr}")
+    except Exception:
+        logger.exception("Unexpected error running spider")
+    finally:
+        with process_lock:
+            scraper_process = None  # ✅ Ensure status is reset
+
+
+@app.get("/scrape")
+def trigger_scraper():
+    thread = threading.Thread(target=run_scrapy_spider, daemon=True)
+    thread.start()
+    return {"message": "Scraper started."}
+
+
+
+
+@app.get("/status")
+def get_scraper_status():
+    global scraper_process
+    with process_lock:
+        if scraper_process and scraper_process.poll() is None:
+            return {"status": "running"}
+        return {"status": "idle"}
+
+@app.get("/terminate")
+def terminate_scraper():
+    global scraper_process
+    with process_lock:
+        if scraper_process and scraper_process.poll() is None:
+            scraper_process.terminate()
+            scraper_process.wait(timeout=5)
+            logger.info("Scraper process terminated.")
+            scraper_process = None
+            return {"message": "Scraper terminated."}
+        return {"message": "No active scraper process to terminate."}
+
+# ✅ UPDATED: /bids supports optional filtering by batch_id
+@app.get("/bids")
+def get_bids(
+    entity: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    classification: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    sort_by: Optional[str] = Query(None),
+    order: Optional[str] = Query("asc")
+):
+    try:
+        query = supabase.table("BiddingDB").select("*")
+
+        # Filters
+        if entity:
+            query = query.ilike("Entity", f"%{entity}%")
+        if category:
+            query = query.ilike("category", f"%{category}%")
+        if classification:
+            query = query.ilike("Classification", f"%{classification}%")
+        if status:
+            query = query.ilike("Status", f"%{status}%")
+
+        # Sort
+        if sort_by:
+            query = query.order(sort_by, desc=(order.lower() == "desc"))
+
+        data = query.range(0, 9999).execute().data
+        return data
+    except Exception as e:
+        logger.exception("Error fetching bids")
+        raise HTTPException(status_code=500, detail="Internal error")
+
+@app.post("/bids")
+def add_bid(bid: BiddingRecord):
+    try:
+        response = supabase.table("BiddingDB").insert(bid.dict()).execute()
+        if response.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail="Failed to add bid")
+        return response.data
+    except Exception:
+        logger.exception("Error adding bid")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# Optional: default route
+@app.get("/")
+def index():
+    return {"message": "Bidding API is live"}
+
+@app.get("/count")
+def get_scrape_summary():
+    try:
+        response = supabase.table("BiddingDB").select("*").range(0,99999).order("batch_id", desc=True).execute()
+
+        data = response.data or []
+        total_count = len(data)
+        logger.info(f"Fetched {total_count} records from Supabase.")
+
+        if total_count == 0:
+            return {
+                "total_count": 0,
+                "last_updated": None,
+                "latest_batch_id": None
+            }
+
+        # Get the latest batch_id
+        latest_batch_id = data[0].get("batch_id")
+
+        # Filter for entries with latest batch_id
+        latest_batch_entries = [entry for entry in data if entry.get("batch_id") == latest_batch_id]
+
+        # Safely parse timestamps
+        def safe_parse_datetime(dt_str):
+            try:
+                return datetime.fromisoformat(dt_str)
+            except Exception:
+                return None
+
+        timestamps = [
+            safe_parse_datetime(entry.get("created_at") or entry.get("updated_at"))
+            for entry in latest_batch_entries
+        ]
+        timestamps = [ts for ts in timestamps if ts is not None]
+
+        latest_time = max(timestamps) if timestamps else None
+
+        return {
+            "total_count": total_count,
+            "last_updated": latest_time.isoformat() if latest_time else None,
+            "latest_batch_id": latest_batch_id
+        }
+
+    except Exception as e:
+        logger.exception(f"Error in /count endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/export/csv")
+def export_bids_csv(batch_id: Optional[str] = None):
+    try:
+        query = supabase.table("BiddingDB").select("*")
+        if batch_id:
+            query = query.eq("batch_id", batch_id)
+        response = query.execute()
+        data = response.data or []
+
+        df = pd.DataFrame(data)
+        stream = io.StringIO()
+        df.to_csv(stream, index=False)
+        stream.seek(0)
+
+        return StreamingResponse(
+            iter([stream.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=bidding_data.csv"}
+        )
+    except Exception:
+        logger.exception("Error exporting CSV")
+        raise HTTPException(status_code=500, detail="Failed to export CSV")
+
+
+@app.get("/export/xls")
+def export_bids_xls(batch_id: Optional[str] = None):
+    try:
+        query = supabase.table("BiddingDB").select("*")
+        if batch_id:
+            query = query.eq("batch_id", batch_id)
+        response = query.execute()
+        data = response.data or []
+
+        df = pd.DataFrame(data)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name="Bids")
+        output.seek(0)
+
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=bidding_data.xlsx"}
+        )
+    except Exception:
+        logger.exception("Error exporting XLSX")
+        raise HTTPException(status_code=500, detail="Failed to export XLSX")
+    
+@app.get("/opportunity-count")
+async def get_opportunity_count():
+    """
+    Returns the public opportunity count directly from the PhilGEPS splash page.
+    """
+    url = "https://notices.philgeps.gov.ph/GEPS/Tender/SplashOpportunitiesSearchUI.aspx?menuIndex=3&ClickFrom=OpenOpp&Result=3"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Match the span containing something like "21,677 opportunities found"
+        span = soup.find("span", string=re.compile(r"\d[\d,]*\s+opportunities\s+found"))
+
+        if not span:
+            raise HTTPException(status_code=404, detail="Opportunity count not found on page")
+
+        # Extract just the number
+        match = re.search(r"(\d[\d,]*)", span.text)
+        if match:
+            count = match.group(1).replace(",", "")
+            return {"opportunity_count": int(count)}
+        else:
+            raise HTTPException(status_code=500, detail="Could not extract count from text")
+
+    except httpx.HTTPError as e:
+        logger.error(f"Error fetching PhilGEPS page: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch opportunity count")
+
+@app.get("/count-exact")
+def get_filtered_count(batch_id: Optional[str] = Query(None)):
+    try:
+        query = supabase.table("BiddingDB").select("*", count="exact", head=True)
+        if batch_id:
+            query = query.eq("batch_id", batch_id)
+        response = query.execute()
+        return {
+            "total_count": response.count
+        }
+    except Exception as e:
+        logger.exception(f"Error in /count-exact endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.delete("/delete")
+def delete_all_bids():
+    try:
+        response = supabase.table("BiddingDB").delete().neq("id", 0).execute()
+        if response.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail="Failed to delete bids")
+
+        return {"message": "All bids deleted successfully."}
+    except Exception:
+        logger.exception("Error deleting all bids")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+
+
+
+@app.get("/filters")
+def get_filters(value: Optional[str] = Query(None)):
+    try:
+        query = supabase.table("Filters").select("*")
+        if value:
+            query = query.ilike("value", f"%{value}%")
+        response = query.execute()
+        return response.data or []
+    except Exception as e:
+        logger.exception(f"Error fetching filters: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+@app.get("/matched-biddings")
+def get_matched_biddings():
+    try:
+        # Step 1: Get filters
+        filters_response = supabase.table("Filters").select("value").execute()
+        filter_values = [f["value"].strip() for f in filters_response.data or [] if f.get("value")]
+
+        if not filter_values:
+            return []
+
+        # Step 2: Build regex pattern (same logic as in Google Sheets)
+        regex_pattern = "(?i)" + "|".join(re.escape(val) for val in filter_values)
+
+        # Step 3: Fetch recent biddings
+        biddings = supabase.table("BiddingDB").select("*").limit(1000).execute().data or []
+
+        # Step 4: Match using regex
+        matched = []
+        for bid in biddings:
+            category = bid.get("category", "")
+            if re.search(regex_pattern, category):
+                matched.append(bid)
+
+        return matched
+
+    except Exception as e:
+        logger.exception(f"Error matching biddings with filters: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+class RefNumberRequest(BaseModel):
+    reference_number: str
+@app.post("/create-ticket")
+async def create_jira_ticket(req: RefNumberRequest):
+    ref_number = req.reference_number
+    print("Ref number received:", ref_number)
+
+    try:
+        # Adjust for async if your Supabase client supports it, else keep as sync
+        data = supabase.table("BiddingDB") \
+            .select("*") \
+            .eq("ReferenceNo", ref_number) \
+            .execute()  # <-- If async, await this call
+
+        if not data.data:
+            logger.warning(f"Reference number {ref_number} not found in Supabase.")
+            raise HTTPException(status_code=404, detail="Reference number not found.")
+
+        row = data.data[0]
+
+        payload = {
+            "fields": {
+                "project": {"key": JIRA_PROJECT_KEY},
+                "summary": row.get("Title", "No Title"),
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": row.get("Summary", "No description provided.")
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "issuetype": {"name": "Bidding Opportunity"},
+                "customfield_10042": row.get("ReferenceNo"),
+                "customfield_10043": row.get("Title"),
+                "customfield_10039": row.get("Entity"),
+                "customfield_10056": row.get("Classification"),
+                "customfield_10050": row.get("category"),
+                "customfield_10057": row.get("ABC"),
+                "customfield_10051": row.get("PublishDate"),
+                "customfield_10053": row.get("ClosingDate"),
+                "customfield_10040": row.get("PageURL"),
+            }
+        }
+
+        response = requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/issue",
+            json=payload,
+            auth=(JIRA_EMAIL, JIRA_API_KEY),
+            headers={"Content-Type": "application/json"}
+        )
+
+        if response.status_code != 201:
+            logger.error(f"Failed to create JIRA issue: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=500, detail=f"JIRA Error: {response.text}")
+
+        issue_key = response.json().get("key")
+        logger.info(f"JIRA issue created successfully: {issue_key} for ref {ref_number}")
+        return {"status": "success", "jira_issue_key": issue_key}
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.exception(f"Unexpected error creating JIRA ticket for {ref_number}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+async def fetch_page_content(url: str) -> str:
+    async with httpx.AsyncClient() as http_client:
+        resp = await http_client.get(url)
+        resp.raise_for_status()
+        return resp.text
+    
+async def get_openrouter_completion(prompt: str, retries=3, delay=1):
+    for attempt in range(retries):
+        try:
+            completion = client.chat.completions.create(
+                model="nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+                messages=[
+                    {"role": "system", "content": "You are a helpful and knowledgeable bidding assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                extra_headers={
+                    "HTTP-Referer": "http://127.0.0.1:8000/",
+                    "X-Title": "Your Site Name",
+                },
+            )
+            return completion
+        except Exception as e:
+            if attempt == retries - 1:
+                raise HTTPException(status_code=503, detail=f"OpenRouter service unavailable: {str(e)}")
+            await asyncio.sleep(delay * (2 ** attempt))  # exponential backoff
+
+@app.post("/analyze")
+async def analyze_reference(req: RefNumberRequest):
+    reference_no = req.reference_number.strip()
+    print(f"Looking for ReferenceNo: '{reference_no}'")
+
+    # Use the column name exactly as in your DB
+    # Try "ReferenceNo" first, if no results, try lowercase version 'referenceno'
+    records = supabase.table("BiddingDB").select("*").eq("ReferenceNo", reference_no).execute()
+
+    print(f"Query results: {records.data}")
+
+    if not records.data or len(records.data) == 0:
+        raise HTTPException(status_code=404, detail=f"ReferenceNo '{reference_no}' not found")
+
+    record = records.data[0]
+
+    prompt = f"""
+You are an expert bidding consultant. Analyze the following bidding record and provide clear insights on:
+
+1. Which entity or organization is offering the contract.
+2. The requirements and the approved budget of the contract.
+3. Strategic advice: What should a bidder do to win this contract.
+4. What products or services are needed according to the bidding details.
+
+Bidding Record Details:
+ReferenceNo: {record.get('ReferenceNo')}
+Title: {record.get('Title')}
+Summary: {record.get('Summary')}
+Requirements List: {record.get('REQT_LIST')}
+Approved Budget: {record.get('ApprovedBudget') if record.get('ApprovedBudget') else 'Not provided'}
+Other Details: {record.get('OtherDetails') if record.get('OtherDetails') else 'N/A'}
+
+Provide a concise, professional summary answering points 1 to 4.
+"""
+
+    completion = await get_openrouter_completion(prompt)
+    answer = completion.choices[0].message.content.strip()
+
+    return {
+        "reference_no": reference_no,
+        "summary": answer,
+    }
+
+class UserQuestion(BaseModel):
+    question: str
+
+
+
+class UserQuestion(BaseModel):
+    question: str
+
+@app.post("/ask")
+async def ask_bot(req: UserQuestion):
+    query = req.question.strip()
+    print(f"[Aiva] User asked: {query}")
+
+    # Step 1: Fetch recent bidding records
+    all_records = supabase.table("BiddingDB").select("*").limit(100).execute().data or []
+    print(f"[Aiva] Retrieved {len(all_records)} records")
+
+    if not all_records:
+        raise HTTPException(status_code=404, detail="No bidding records available")
+
+    # Step 2: Format records into a prompt-friendly summary
+    summarized_records = []
+    for r in all_records:
+        summary = f"""
+ReferenceNo: {r.get('ReferenceNo')}
+Title: {r.get('Title')}
+Entity: {r.get('Entity')}
+Category: {r.get('category')}
+Summary: {r.get('Summary')}
+Requirements: {r.get('REQT_LIST')}
+Budget: {r.get('ApprovedBudget') or 'N/A'}
+"""
+        summarized_records.append(summary.strip())
+
+    # Step 3: Send to LLM for smart matching + answering
+    prompt = f"""
+You are Aiva, a smart bidding assistant.
+
+The user asked:
+"{query}"
+
+Here are recent bidding opportunities:
+
+{chr(10).join(summarized_records)}
+
+Please do the following:
+1. Identify the most relevant bidding record based on the user's question.
+2. If the user is asking for advice (e.g. how to win), provide strategic suggestions using only the matching record's data.
+3. If they are asking about a specific agency, ReferenceNo, or category, focus on that.
+4. If no relevant record is found, say so politely.
+
+Be concise, helpful, and avoid making anything up.
+"""
+
+    try:
+        completion = await get_openrouter_completion(prompt)
+        answer = completion.choices[0].message.content.strip()
+        return {
+            "question": query,
+            "answer": answer
+        }
+    except Exception as e:
+        print(f"[Aiva] Error with OpenRouter: {str(e)}")
+        raise HTTPException(status_code=503, detail="Aiva is temporarily unavailable.")
+
+
+class ChatMessage(BaseModel):
+    user_id: str
+    question: str
+
+@app.post("/chat")
+async def chat_with_bot(req: ChatMessage):
+    message_id = str(uuid4())  # Create unique ID for the message
+
+    # Step 1: Save the user message with no answer yet
+    supabase.table("Messages").insert({
+        "id": message_id,
+        "user_id": req.user_id,
+        "question": req.question,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+
+    # Step 2: Generate answer from LLM
+    prompt = f"You are a helpful bidding assistant.\n\nUser asked:\n{req.question}"
+    try:
+        completion = await get_openrouter_completion(prompt)
+        answer = completion.choices[0].message.content.strip()
+    except Exception as e:
+        # Optional: update message with error if needed
+        answer = "Sorry, something went wrong while generating the response."
+
+    # Step 3: Update the same row with the answer
+    supabase.table("Messages").update({
+        "answer": answer
+    }).eq("id", message_id).execute()
+
+    # Step 4: Return full chat message
+    return {
+        "id": message_id,
+        "user_id": req.user_id,
+        "question": req.question,
+        "answer": answer
+    }
+
+
+@app.get("/dashboard")
+async def redirect_to_dashboard():
+    # Replace with your Streamlit dashboard URL or proxied path
+    streamlit_url = "https://contacting-saving-scholarship-tourism.trycloudflare.com/dashboard"
+    return RedirectResponse(url=streamlit_url)
+
+
+@app.post("/add-monday")
+async def add_to_monday(req: RefNumberRequest):
+    ref_number = req.reference_number
+    logger.info(f"Received request to add to Monday.com for REF_NO: {ref_number}")
+
+    try:
+        # Step 1: Fetch record from Supabase
+        data = supabase.table("BiddingDB").select("*").eq("ReferenceNo", ref_number).execute()
+
+        if not data.data:
+            logger.warning(f"Reference number {ref_number} not found in Supabase.")
+            raise HTTPException(status_code=404, detail="Reference number not found.")
+
+        row = data.data[0]
+
+        # Step 2: Format ClosingDate as "YYYY-MM-DD" for Monday
+        raw_closing = row.get("ClosingDate") or ""
+        closing_date = None
+
+        try:
+            dt = datetime.strptime(raw_closing, "%d/%m/%Y %I:%M %p")  # Format like 26/06/2025 9:00 AM
+            closing_date = dt.strftime("%Y-%m-%d")
+        except:
+            try:
+                dt = datetime.fromisoformat(raw_closing)
+                closing_date = dt.strftime("%Y-%m-%d")
+            except:
+                logger.warning(f"Invalid or missing ClosingDate for REF_NO {ref_number}: '{raw_closing}'")
+
+        # Step 3: Prepare Monday API request
+        monday_api_key = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUyNDA5MDU5MSwiYWFpIjoxMSwidWlkIjo3NjM0ODg3NiwiaWFkIjoiMjAyNS0wNi0wOVQyMzozMTozNy4wNDFaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MjkzNjkzMjUsInJnbiI6ImFwc2UyIn0.Yd4H1z49REDKJmjKUo3I85oVKTOpFFBM51BYOIGd7L0"
+        board_id = 2012347948
+
+        query = """
+        mutation ($itemName: String!, $columnValues: JSON!) {
+            create_item(board_id: %d, item_name: $itemName, column_values: $columnValues) {
+                id
+            }
+        }
+        """ % board_id
+
+        # Step 4: Construct the column values
+        column_values = {
+            "deal_close_date": closing_date,
+            "text_mkr1cfz1": row.get("Entity"),
+            "text_mkr1mrm3": row.get("category"),
+            "deal_value": row.get("ABC"),
+            "text_mkr1h79n": row.get("ReferenceNo"),
+            "link_mkr11ah7": {
+                "url": row.get("PageURL"),
+                "text": "View Page"
+            },
+            "text_mkr1fzy3": row.get("contact"),
+            "long_text_mkr1xz3h": row.get("Summary")
+        }
+
+        headers = {
+            "Authorization": monday_api_key,
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "query": query,
+            "variables": {
+                "itemName": row.get("Title", f"Bid - {ref_number}"),
+                "columnValues": json.dumps(column_values)
+            }
+        }
+
+        # Step 5: Send the request
+        response = requests.post("https://api.monday.com/v2", json=payload, headers=headers)
+
+        if response.status_code != 200 or "errors" in response.json():
+            logger.error(f"Monday.com error: {response.text}")
+            raise HTTPException(status_code=500, detail=f"Failed to create Monday item: {response.text}")
+
+        item_id = response.json()["data"]["create_item"]["id"]
+        logger.info(f"Monday.com item created successfully: {item_id}")
+        return {"status": "success", "monday_item_id": item_id}
+
+    except Exception as e:
+        logger.exception(f"Error while creating Monday item for REF_NO {ref_number}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
